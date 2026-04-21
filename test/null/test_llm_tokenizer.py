@@ -1,5 +1,5 @@
 import unittest, base64, functools, sys
-from tinygrad.llm.cli import SimpleTokenizer
+from tinygrad.llm.cli import SimpleTokenizer, Gemma4Tokenizer, tokenizer_from_gguf_kv
 from tinygrad.helpers import fetch
 
 @unittest.skipIf(sys.platform == 'win32', "fetch race condition on Windows")
@@ -58,6 +58,23 @@ class TestLLMTokenizer(unittest.TestCase):
     self.assertEqual(tok.encode("hello"), [5])
     self.assertEqual(tok.end_turn(), [4])
     self.assertEqual(tok.role("assistant"), [])
+
+  def test_gemma4_from_gguf_kv(self):
+    kv = {
+      "general.architecture": "gemma4",
+      "tokenizer.ggml.model": "gemma4",
+      "tokenizer.ggml.tokens": ["<pad>", "<eos>", "<bos>", "<unk>", "<|turn>", "<turn|>", "user", "model", "hello", "▁world", "\n"],
+      "tokenizer.ggml.token_type": [3, 3, 3, 3, 3, 3, 1, 1, 1, 1, 1],
+      "tokenizer.ggml.bos_token_id": 2,
+      "tokenizer.ggml.eos_token_id": 1,
+    }
+    tok = tokenizer_from_gguf_kv(kv)
+    self.assertIsInstance(tok, Gemma4Tokenizer)
+    self.assertEqual(tok.prefix(), [2])
+    self.assertEqual(tok.encode("hello world"), [8, 9])
+    self.assertEqual(tok.role("user"), [4, 6, 10])
+    self.assertEqual(tok.role("assistant"), [4, 7, 10])
+    self.assertEqual(tok.end_turn(), [5, 10])
 
   def test_stream_decoder(self):
     """stream_decoder buffers incomplete UTF-8: token 25677 has 3/4 of emoji, token 138 completes it."""

@@ -5,6 +5,24 @@ from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_lo
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 from tinygrad.llm.model import Transformer
 
+class Tokenizer(typing.Protocol):
+  preset: str
+  bos_id: int|None
+  eos_id: int
+  eot_id: int|None
+  def encode(self, text:str) -> list[int]: ...
+  def decode(self, ids:list[int]) -> str: ...
+  def stream_decoder(self) -> typing.Callable[..., str]: ...
+  def role(self, role:str) -> list[int]: ...
+  def end_turn(self) -> list[int]: ...
+  def prefix(self) -> list[int]: ...
+  def is_end(self, token_id:int) -> bool: ...
+  def close_last_assistant_turn(self) -> bool: ...
+
+class LLMModel(typing.Protocol):
+  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0): ...
+  def get_start_pos(self, tokens:list[int]) -> int: ...
+
 class SimpleTokenizer:
   def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3",
                bos_id:int|None=None, eos_id:int=0, eot_id:int|None=None):
@@ -83,6 +101,100 @@ class SimpleTokenizer:
   def prefix(self) -> list[int]:
     return ([] if self.bos_id is None else [self.bos_id]) + (self.encode("<sop>") if self.preset == 'glm4' else [])
   def is_end(self, token_id:int) -> bool: return token_id in (self.eos_id, self.eot_id)
+  def close_last_assistant_turn(self) -> bool: return False
+
+class Gemma4Tokenizer:
+  def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], bos_id:int|None=None, eos_id:int=0, eot_id:int|None=None,
+               end_ids:typing.Iterable[int]|None=None):
+    # GGUF exports Gemma 4 as a distinct tokenizer family with an embedded chat template.
+    # Keep this path separate from SimpleTokenizer so we can refine it independently.
+    self.preset = "gemma4"
+    self.bos_id, self.eos_id, self.eot_id = bos_id, eos_id, eot_id
+    self._normal_tokens = normal_tokens
+    self._special_tokens = special_tokens
+    self._max_token_len = max(map(len, self._normal_tokens), default=0)
+    self._tok2bytes = {tid: tok.encode() for tok, tid in self._normal_tokens.items()} | {tid: tok.encode() for tok, tid in self._special_tokens.items()}
+    self._split_to_sentence = re.compile("|".join(re.escape(tok) for tok in special_tokens.keys()) if special_tokens else r"(?!)")
+    self._end_ids = {tid for tid in ([*([] if end_ids is None else end_ids), eos_id, eot_id]) if tid is not None}
+
+  @staticmethod
+  def from_gguf_kv(kv:dict):
+    all_tokens = kv["tokenizer.ggml.tokens"]
+    tok2id = {tok: idx for idx, tok in enumerate(all_tokens)}
+    vocab: typing.Iterable[tuple[str, int]] = ((tok, idx) for idx, tok in enumerate(all_tokens))
+    normal_tokens, special_tokens = partition(vocab, lambda e: kv["tokenizer.ggml.token_type"][e[1]] == 1)
+    special_tokens = dict(special_tokens)
+    end_ids = [tid for tid in (kv.get('tokenizer.ggml.eos_token_id', 0), kv.get('tokenizer.ggml.eot_token_id'),
+                               tok2id.get("<eos>"), tok2id.get("<turn|>")) if tid is not None]
+    return Gemma4Tokenizer(dict(normal_tokens), special_tokens,
+      bos_id=kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', True) else None,
+      eos_id=kv.get('tokenizer.ggml.eos_token_id', 0), eot_id=kv.get('tokenizer.ggml.eot_token_id'), end_ids=end_ids)
+
+  def _encode_sentence(self, text:str) -> list[int]:
+    if not text: return []
+    # Gemma 4 normalizes spaces into ▁ before applying merges. Keep the implementation
+    # separate from SimpleTokenizer and use longest-prefix matching against the GGUF vocab.
+    pieces = text.replace(" ", "▁")
+    tokens: list[int] = []
+    pos = 0
+    while pos < len(pieces):
+      end = min(len(pieces), pos + self._max_token_len)
+      while end > pos and (tok:=self._normal_tokens.get(pieces[pos:end])) is None: end -= 1
+      if end == pos: raise RuntimeError(f"token not found: {pieces[pos:pos+16]!r}")
+      tokens.append(tok)
+      pos = end
+    return tokens
+
+  def encode(self, text:str) -> list[int]:
+    tokens: list[int] = []
+    pos = 0
+    for match in self._split_to_sentence.finditer(text):
+      tokens.extend(self._encode_sentence(text[pos:match.start(0)]) + [self._special_tokens[text[match.start(0):match.end(0)]]])
+      pos = match.end(0)
+    return tokens + self._encode_sentence(text[pos:])
+
+  def decode(self, ids:list[int]) -> str:
+    return b''.join(self._tok2bytes[tid] for tid in ids).decode(errors='replace').replace("▁", " ")
+
+  def stream_decoder(self) -> typing.Callable[..., str]:
+    dec = codecs.getincrementaldecoder('utf-8')('replace')
+    def _decode(tid:int|None=None) -> str:
+      return dec.decode(self._tok2bytes[tid].replace(b"\xe2\x96\x81", b" ")) if tid is not None else dec.decode(b'', final=True)
+    return _decode
+
+  def role(self, role:str) -> list[int]:
+    role = {"assistant": "model"}.get(role, role)
+    if role not in ("system", "developer", "user", "model"): raise ValueError(f"Unsupported role '{role}' for tokenizer preset '{self.preset}'")
+    return self.encode(f"<|turn>{role}\n")
+
+  def end_turn(self) -> list[int]: return self.encode("<|turn|>\n")
+  def prefix(self) -> list[int]: return [] if self.bos_id is None else [self.bos_id]
+  def is_end(self, token_id:int) -> bool: return token_id in self._end_ids
+  def close_last_assistant_turn(self) -> bool: return True
+
+def tokenizer_from_gguf_kv(kv:dict) -> Tokenizer:
+  if kv.get("tokenizer.ggml.model") == "gemma4" or kv.get("general.architecture") == "gemma4":
+    return Gemma4Tokenizer.from_gguf_kv(kv)
+  return SimpleTokenizer.from_gguf_kv(kv)
+
+def build_chat_completion_ids(tok:Tokenizer, messages:list[dict[str, typing.Any]]) -> list[int]:
+  # Match /v1/chat/completions message serialization exactly.
+  ids: list[int] = tok.prefix()
+  for i, msg in enumerate(messages):
+    ids += tok.role(msg["role"])
+    content = msg["content"]
+    if isinstance(content, str): ids += tok.encode(content)
+    elif isinstance(content, list):
+      for c in content:
+        if c["type"] == "text": ids += tok.encode(c["text"])
+        else: raise RuntimeError(f"unhandled type: {c['type']}")
+    else: raise RuntimeError(f"unknown content type: {type(content)}")
+    if msg["role"] == "assistant" and i == len(messages) - 1:
+      if tok.close_last_assistant_turn(): ids += tok.end_turn()
+      break
+    ids += tok.end_turn()
+  else: ids += tok.role("assistant")
+  return ids
 
 models = {
   "llama3.2:1b": "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q6_K.gguf",
@@ -102,6 +214,7 @@ models = {
   "olmoe": "https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct-GGUF/resolve/main/olmoe-1b-7b-0924-instruct-q4_k_m.gguf",
   "moonlight": "https://huggingface.co/gabriellarson/Moonlight-16B-A3B-Instruct-GGUF/resolve/main/Moonlight-16B-A3B-Instruct-Q4_K_M.gguf",
   "glm-4.7-flash": "https://huggingface.co/unsloth/GLM-4.7-Flash-GGUF/resolve/main/GLM-4.7-Flash-Q4_K_M.gguf",
+  "gemma4:E4B-it": "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf",
 }
 
 # *** simple OpenAI API compatible server with web interface on http://localhost:8000/ ***
@@ -127,7 +240,8 @@ class Handler(HTTPRequestHandler):
       if len(out) == 0: stderr_log(f"prefill:{(len(ids)-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
       if tok.is_end(next_id): break
       out.append(next_id)
-      yield {"choices": [{"index":0, "delta":{"content":dec(next_id)}, "finish_reason":None}], **tmpl}
+      piece = dec(next_id)
+      yield {"choices": [{"index":0, "delta":{"content":piece}, "finish_reason":None}], **tmpl}
       if max_tokens is not None and len(out) >= max_tokens:
         finish_reason = "length"
         break
@@ -145,20 +259,7 @@ class Handler(HTTPRequestHandler):
     body: dict[str, typing.Any] = json.loads(raw_body.decode("utf-8"))
     if DEBUG >= 1: print(json.dumps(body, indent=2))
     if self.path == "/v1/chat/completions":
-      # extract tokens, last assistant message is treated as prefill
-      ids: list[int] = tok.prefix()
-      for i, msg in enumerate(body["messages"]):
-        ids += tok.role(msg["role"])
-        content = msg["content"]
-        if isinstance(content, str): ids += tok.encode(content)
-        elif isinstance(content, list):
-          for c in content:
-            if c["type"] == "text": ids += tok.encode(c["text"])
-            else: raise RuntimeError(f"unhandled type: {c['type']}")
-        else: raise RuntimeError(f"unknown content type: {type(content)}")
-        if msg["role"] == "assistant" and i == len(body["messages"]) - 1: break
-        ids += tok.end_turn()
-      else: ids += tok.role("assistant")
+      ids = build_chat_completion_ids(tok, body["messages"])
 
       # reply
       max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
@@ -176,7 +277,7 @@ class Handler(HTTPRequestHandler):
       raise RuntimeError(f"unhandled path {self.path}")
 
 class LLMServer(TCPServerWithReuse):
-  def __init__(self, server_address:tuple, model:Transformer, model_name:str, tok:SimpleTokenizer):
+  def __init__(self, server_address:tuple, model:LLMModel, model_name:str, tok:Tokenizer):
     self.model, self.model_name, self.tok = model, model_name, tok
     super().__init__(server_address, Handler)
 
