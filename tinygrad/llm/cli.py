@@ -5,179 +5,161 @@ from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, stderr_lo
 from tinygrad.viz.serve import TCPServerWithReuse, HTTPRequestHandler
 from tinygrad.llm.model import Transformer
 
-class Tokenizer(typing.Protocol):
-  preset: str
-  bos_id: int|None
-  eos_id: int
-  eot_id: int|None
-  def encode(self, text:str) -> list[int]: ...
-  def decode(self, ids:list[int]) -> str: ...
-  def stream_decoder(self) -> typing.Callable[..., str]: ...
-  def role(self, role:str) -> list[int]: ...
-  def end_turn(self) -> list[int]: ...
-  def prefix(self) -> list[int]: ...
-  def is_end(self, token_id:int) -> bool: ...
-  def close_last_assistant_turn(self) -> bool: ...
+def chat_config_from_gguf_kv(kv:dict, special_tokens:dict[str, int]) -> tuple[str, set[int]]:
+  if kv.get("tokenizer.ggml.model") == "gemma4" or kv.get("general.architecture") == "gemma4":
+    tok2id = {tok: idx for idx, tok in enumerate(kv["tokenizer.ggml.tokens"])}
+    return "gemma4", {tid for tid in (kv.get('tokenizer.ggml.eos_token_id'), kv.get('tokenizer.ggml.eot_token_id'),
+                                      tok2id.get("<eos>"), tok2id.get("<turn|>"), tok2id.get("<|turn|>")) if tid is not None}
 
-class LLMModel(typing.Protocol):
-  def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0): ...
-  def get_start_pos(self, tokens:list[int]) -> int: ...
+  preset = kv.get("tokenizer.ggml.pre")
+  if preset is None:
+    if "<|im_start|>" in special_tokens: preset = "qwen2"
+    elif "<|start_header_id|>" in special_tokens and "<|end_header_id|>" in special_tokens: preset = "llama3"
+    elif "[INST]" in special_tokens and "[/INST]" in special_tokens: preset = "tekken"
+    else: raise ValueError("Unable to determine chat format from GGUF metadata")
+  return {"qwen35":"qwen2","qwen35moe":"qwen2"}.get(preset, preset), set()
 
 class SimpleTokenizer:
   def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3",
-               bos_id:int|None=None, eos_id:int=0, eot_id:int|None=None):
+               bos_id:int|None=None, eos_id:int=0, eot_id:int|None=None, end_ids:typing.Iterable[int]|None=None,
+               merge_ranks:dict[tuple[str, str], int]|None=None, chat_format:str|None=None, space_marker:str|None=None,
+               decode_replacements:tuple[tuple[bytes, bytes], ...]=(), regex_split:bool=True, byte_fallback:bool=False):
     preset = {"qwen35":"qwen2","qwen35moe":"qwen2"}.get(preset, preset)
-    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo","kimi-k2","tekken","glm4"):
+    if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo","kimi-k2","tekken","glm4","gemma4"):
       raise ValueError(f"Invalid tokenizer preset '{preset}'")
-    # https://github.com/openai/gpt-2/blob/9b63575ef42771a015060c964af2c3da4cf7c8ab/src/encoder.py#L9
-    bs = [*range(33, 127), *range(161, 173), *range(174, 256)]  # bytes that map to themselves
-    self._byte_decoder = {chr(b): b for b in bs} | {chr(256+i): b for i,b in enumerate(b for b in range(256) if b not in bs)}
-
-    # https://github.com/ggml-org/llama.cpp/blob/94933c8c2eeaa9a7983e3f6c08af76bd86724094/src/llama-vocab.cpp#L286
-    # 0x323b0 is one past the max codepoint in unicode categories L/N/Z (0x323af is max L)
-    def ucat_range(pre: str): return "".join(re.escape(chr(cp)) for cp in range(0x323b0) if unicodedata.category(chr(cp)).startswith(pre))
-    r_ws, r_p_N, r_p_L = r"\t\n\x0b\x0c\r\x85" + ucat_range("Z"), ucat_range("N"), ucat_range("L")
-    self._split_to_word = re.compile("(?i:'s|'t|'re|'ve|'m|'ll|'d)|" + \
-      f"[^\\r\\n{r_p_N}{r_p_L}]?[{r_p_L}]+|[{r_p_N}]{{1,3}}| ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n]*|[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
-    self._split_to_sentence = re.compile("|".join(re.escape(tok) for tok in special_tokens.keys()) if special_tokens else r"(?!)")
-
-    self._normal_tokens = {bytes(self._byte_decoder[c] for c in tok): tid for tok, tid in normal_tokens.items()}
     self._special_tokens = special_tokens
-    self._tok2bytes = {tid: tok for tok, tid in self._normal_tokens.items()} | {tid: tok.encode() for tok, tid in self._special_tokens.items()}
+    self._split_to_sentence = re.compile("|".join(re.escape(tok) for tok in special_tokens.keys()) if special_tokens else r"(?!)")
     self.preset = preset
+    self.chat_format = chat_format or ("gemma4" if end_ids else preset)
     self.bos_id, self.eos_id, self.eot_id = bos_id, eos_id, eot_id
+    self._end_ids = {tid for tid in ([] if end_ids is None else end_ids) if tid is not None}
+    self._space_marker = space_marker
+    self._decode_replacements = decode_replacements
+    self._merge_ranks = {} if merge_ranks is None else merge_ranks
+    self._split_to_word = None
+    self._byte_tokens: dict[str, int] | None = None
+    if not byte_fallback:
+      # https://github.com/openai/gpt-2/blob/9b63575ef42771a015060c964af2c3da4cf7c8ab/src/encoder.py#L9
+      bs = [*range(33, 127), *range(161, 173), *range(174, 256)]  # bytes that map to themselves
+      self._byte_decoder = {chr(b): b for b in bs} | {chr(256+i): b for i,b in enumerate(b for b in range(256) if b not in bs)}
+      self._normal_tokens = {bytes(self._byte_decoder[c] for c in tok): tid for tok, tid in normal_tokens.items()}
+      self._tok2bytes = {tid: tok for tok, tid in self._normal_tokens.items()} | {tid: tok.encode() for tok, tid in self._special_tokens.items()}
+      if regex_split:
+        # https://github.com/ggml-org/llama.cpp/blob/94933c8c2eeaa9a7983e3f6c08af76bd86724094/src/llama-vocab.cpp#L286
+        # 0x323b0 is one past the max codepoint in unicode categories L/N/Z (0x323af is max L)
+        def ucat_range(pre: str): return "".join(re.escape(chr(cp)) for cp in range(0x323b0) if unicodedata.category(chr(cp)).startswith(pre))
+        r_ws, r_p_N, r_p_L = r"\t\n\x0b\x0c\r\x85" + ucat_range("Z"), ucat_range("N"), ucat_range("L")
+        self._split_to_word = re.compile("(?i:'s|'t|'re|'ve|'m|'ll|'d)|" + \
+          f"[^\\r\\n{r_p_N}{r_p_L}]?[{r_p_L}]+|[{r_p_N}]{{1,3}}| ?[^{r_ws}{r_p_N}{r_p_L}]+[\\r\\n]*|[{r_ws}]*[\\r\\n]+|[{r_ws}]+(?![^{r_ws}])|[{r_ws}]+")
+    else:
+      self._normal_tokens = normal_tokens
+      self._byte_tokens = {f"<0x{b:02X}>": tid for b in range(256) if (tid:=self._normal_tokens.get(f"<0x{b:02X}>")) is not None}
+      self._tok2bytes = {tid: self._token_to_bytes(tok) for tok, tid in self._normal_tokens.items()} | {tid: tok.encode() for tok, tid in self._special_tokens.items()}
 
   @staticmethod
   def from_gguf_kv(kv:dict):
+    normal_tokens, special_tokens, bos_id, eos_id, eot_id = SimpleTokenizer._load_gguf_kv(kv)
+    chat_format, end_ids = chat_config_from_gguf_kv(kv, special_tokens)
+    if chat_format == "gemma4":
+      return SimpleTokenizer(normal_tokens, special_tokens, "gemma4", bos_id=bos_id, eos_id=eos_id, eot_id=eot_id, end_ids=end_ids,
+                             merge_ranks={tuple(merge.split(" ", 1)): rank for rank, merge in enumerate(kv.get("tokenizer.ggml.merges", []))},
+                             chat_format=chat_format, space_marker="▁", decode_replacements=((b"\xe2\x96\x81", b" "),),
+                             regex_split=False, byte_fallback=True)
+    return SimpleTokenizer(normal_tokens, special_tokens, chat_format, bos_id=bos_id, eos_id=eos_id, eot_id=eot_id, chat_format=chat_format)
+
+  @staticmethod
+  def _load_gguf_kv(kv:dict) -> tuple[dict[str, int], dict[str, int], int|None, int, int|None]:
     # https://github.com/ggml-org/llama.cpp/blob/94933c8c2eeaa9a7983e3f6c08af76bd86724094/src/llama-vocab.cpp#L1818-L1820
     vocab: typing.Iterable[tuple[str, int]] = ((tok, idx) for idx, tok in enumerate(kv["tokenizer.ggml.tokens"]))
     normal_tokens, special_tokens = partition(vocab, lambda e: kv["tokenizer.ggml.token_type"][e[1]] == 1)
-    return SimpleTokenizer(dict(normal_tokens), dict(special_tokens), kv["tokenizer.ggml.pre"],
-      bos_id=kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', True) else None,
-      eos_id=kv.get('tokenizer.ggml.eos_token_id', 0), eot_id=kv.get('tokenizer.ggml.eot_token_id'))
-
-  def _encode_word(self, word:bytes) -> list[int]:
-    if (early_token:=self._normal_tokens.get(word)) is not None: return [early_token]
-    parts = [bytes([b]) for b in word]
-    # greedily merge any parts that we can
-    while True:
-      i = min([(sys.maxsize, -1)] + [(self._normal_tokens.get(parts[j]+parts[j+1], sys.maxsize), j) for j in range(len(parts)-1)])[1]
-      if i == -1: break
-      parts[i:i+2] = [parts[i] + parts[i+1]]
-    try: return [self._normal_tokens[p] for p in parts]
-    except KeyError: raise RuntimeError("token not found")
-  def _encode_sentence(self, chunk:str) -> list[int]:
-    return [tok for word in self._split_to_word.findall(chunk) for tok in self._encode_word(word.encode())]
-  def encode(self, text:str) -> list[int]:
-    tokens: list[int] = []
-    pos = 0
-    for match in self._split_to_sentence.finditer(text):
-      tokens.extend(self._encode_sentence(text[pos:match.start(0)]) + [self._special_tokens[text[match.start(0):match.end(0)]]])
-      pos = match.end(0)
-    return tokens + self._encode_sentence(text[pos:])
-
-  def decode(self, ids:list[int]) -> str: return b''.join(self._tok2bytes[tid] for tid in ids).decode(errors='replace')
-  def stream_decoder(self) -> typing.Callable[..., str]:
-    dec = codecs.getincrementaldecoder('utf-8')('replace')
-    def _decode(tid:int|None=None) -> str: return dec.decode(self._tok2bytes[tid]) if tid is not None else dec.decode(b'', final=True)
-    return _decode
-  def role(self, role:str):
-    if self.preset == 'olmo': return self.encode("<|" + role + "|>\n")  # OLMoE Instruct format
-    if self.preset == 'kimi-k2': return self.encode("<|im_" + role + "|>" + role + "<|im_middle|>")
-    if self.preset == 'qwen2': return self.encode("<|im_start|>" + role + "\n")
-    if self.preset == 'glm4': return self.encode("<|" + role + "|>")
-    if self.preset == 'tekken':
-      if role == 'user': return self.encode("[INST]")
-      if role == 'assistant': return []
-      raise ValueError(f"Unsupported role '{role}' for tokenizer preset '{self.preset}'")
-    return self.encode("<|start_header_id|>" + role + "<|end_header_id|>\n\n")
-  def end_turn(self):
-    if self.preset == 'olmo': return self.encode("\n")
-    if self.preset == 'kimi-k2': return [self.eos_id]
-    if self.preset == 'qwen2': return [self.eos_id] + self.encode("\n")
-    if self.preset == 'glm4': return []
-    if self.preset == 'tekken': return self.encode("[/INST]")
-    return [self.eos_id]
-  def prefix(self) -> list[int]:
-    return ([] if self.bos_id is None else [self.bos_id]) + (self.encode("<sop>") if self.preset == 'glm4' else [])
-  def is_end(self, token_id:int) -> bool: return token_id in (self.eos_id, self.eot_id)
-  def close_last_assistant_turn(self) -> bool: return False
-
-class Gemma4Tokenizer:
-  def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], bos_id:int|None=None, eos_id:int=0, eot_id:int|None=None,
-               end_ids:typing.Iterable[int]|None=None):
-    # GGUF exports Gemma 4 as a distinct tokenizer family with an embedded chat template.
-    # Keep this path separate from SimpleTokenizer so we can refine it independently.
-    self.preset = "gemma4"
-    self.bos_id, self.eos_id, self.eot_id = bos_id, eos_id, eot_id
-    self._normal_tokens = normal_tokens
-    self._special_tokens = special_tokens
-    self._max_token_len = max(map(len, self._normal_tokens), default=0)
-    self._tok2bytes = {tid: tok.encode() for tok, tid in self._normal_tokens.items()} | {tid: tok.encode() for tok, tid in self._special_tokens.items()}
-    self._split_to_sentence = re.compile("|".join(re.escape(tok) for tok in special_tokens.keys()) if special_tokens else r"(?!)")
-    self._end_ids = {tid for tid in ([*([] if end_ids is None else end_ids), eos_id, eot_id]) if tid is not None}
+    return dict(normal_tokens), dict(special_tokens), \
+      kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', True) else None, \
+      kv.get('tokenizer.ggml.eos_token_id', 0), kv.get('tokenizer.ggml.eot_token_id')
 
   @staticmethod
-  def from_gguf_kv(kv:dict):
-    all_tokens = kv["tokenizer.ggml.tokens"]
-    tok2id = {tok: idx for idx, tok in enumerate(all_tokens)}
-    vocab: typing.Iterable[tuple[str, int]] = ((tok, idx) for idx, tok in enumerate(all_tokens))
-    normal_tokens, special_tokens = partition(vocab, lambda e: kv["tokenizer.ggml.token_type"][e[1]] == 1)
-    special_tokens = dict(special_tokens)
-    end_ids = [tid for tid in (kv.get('tokenizer.ggml.eos_token_id', 0), kv.get('tokenizer.ggml.eot_token_id'),
-                               tok2id.get("<eos>"), tok2id.get("<turn|>")) if tid is not None]
-    return Gemma4Tokenizer(dict(normal_tokens), special_tokens,
-      bos_id=kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', True) else None,
-      eos_id=kv.get('tokenizer.ggml.eos_token_id', 0), eot_id=kv.get('tokenizer.ggml.eot_token_id'), end_ids=end_ids)
+  def _token_to_bytes(token:str) -> bytes:
+    if re.fullmatch(r"<0x[0-9A-F]{2}>", token): return bytes([int(token[3:5], 16)])
+    return token.encode()
 
-  def _encode_sentence(self, text:str) -> list[int]:
+  def _seed_parts(self, text:str) -> list[bytes] | list[str]:
+    if self._byte_tokens is None: return [bytes([b]) for b in text.encode()]
+    parts: list[str] = []
+    for ch in text:
+      if ch in self._normal_tokens: parts.append(ch)
+      else:
+        for b in ch.encode("utf-8"):
+          byte_token = f"<0x{b:02X}>"
+          if byte_token not in self._byte_tokens: raise RuntimeError(f"token not found: {ch!r}")
+          parts.append(byte_token)
+    return parts
+
+  def _merge_parts(self, parts:list[bytes] | list[str]) -> list[bytes] | list[str]:
+    while True:
+      if self._merge_ranks:
+        best_rank, best_idx = sys.maxsize, -1
+        for i in range(len(parts)-1):
+          if (rank:=self._merge_ranks.get((parts[i], parts[i+1]))) is not None and rank < best_rank:
+            best_rank, best_idx = rank, i
+      else:
+        best_idx = min([(sys.maxsize, -1)] + [(self._normal_tokens.get(parts[j]+parts[j+1], sys.maxsize), j) for j in range(len(parts)-1)])[1]
+      if best_idx == -1: break
+      parts[best_idx:best_idx+2] = [parts[best_idx] + parts[best_idx+1]]
+    return parts
+
+  def _encode_span(self, text:str) -> list[int]:
     if not text: return []
-    # Gemma 4 normalizes spaces into ▁ before applying merges. Keep the implementation
-    # separate from SimpleTokenizer and use longest-prefix matching against the GGUF vocab.
-    pieces = text.replace(" ", "▁")
+    text = text.replace(" ", self._space_marker) if self._space_marker is not None else text
     tokens: list[int] = []
-    pos = 0
-    while pos < len(pieces):
-      end = min(len(pieces), pos + self._max_token_len)
-      while end > pos and (tok:=self._normal_tokens.get(pieces[pos:end])) is None: end -= 1
-      if end == pos: raise RuntimeError(f"token not found: {pieces[pos:pos+16]!r}")
-      tokens.append(tok)
-      pos = end
+    for span in self._split_to_word.findall(text) if self._split_to_word is not None else [text]:
+      try: tokens.extend(self._normal_tokens[p] for p in self._merge_parts(self._seed_parts(span)))
+      except KeyError: raise RuntimeError(f"token not found: {span[:16]!r}")
     return tokens
-
+  def _postprocess_token_bytes(self, token_bytes:bytes) -> bytes:
+    for src, dst in self._decode_replacements: token_bytes = token_bytes.replace(src, dst)
+    return token_bytes
   def encode(self, text:str) -> list[int]:
     tokens: list[int] = []
     pos = 0
     for match in self._split_to_sentence.finditer(text):
-      tokens.extend(self._encode_sentence(text[pos:match.start(0)]) + [self._special_tokens[text[match.start(0):match.end(0)]]])
+      tokens.extend(self._encode_span(text[pos:match.start(0)]) + [self._special_tokens[text[match.start(0):match.end(0)]]])
       pos = match.end(0)
-    return tokens + self._encode_sentence(text[pos:])
-
+    return tokens + self._encode_span(text[pos:])
   def decode(self, ids:list[int]) -> str:
-    return b''.join(self._tok2bytes[tid] for tid in ids).decode(errors='replace').replace("▁", " ")
-
+    return b''.join(self._postprocess_token_bytes(self._tok2bytes[tid]) for tid in ids).decode(errors='replace')
   def stream_decoder(self) -> typing.Callable[..., str]:
     dec = codecs.getincrementaldecoder('utf-8')('replace')
     def _decode(tid:int|None=None) -> str:
-      return dec.decode(self._tok2bytes[tid].replace(b"\xe2\x96\x81", b" ")) if tid is not None else dec.decode(b'', final=True)
+      return dec.decode(self._postprocess_token_bytes(self._tok2bytes[tid])) if tid is not None else dec.decode(b'', final=True)
     return _decode
-
   def role(self, role:str) -> list[int]:
-    role = {"assistant": "model"}.get(role, role)
-    if role not in ("system", "developer", "user", "model"): raise ValueError(f"Unsupported role '{role}' for tokenizer preset '{self.preset}'")
-    return self.encode(f"<|turn>{role}\n")
+    if self.chat_format == 'gemma4':
+      role = {"assistant": "model"}.get(role, role)
+      if role not in ("system", "developer", "user", "model"): raise ValueError(f"Unsupported role '{role}' for tokenizer preset '{self.preset}'")
+      return self.encode(f"<|turn>{role}\n")
+    if self.chat_format == 'olmo': return self.encode("<|" + role + "|>\n")  # OLMoE Instruct format
+    if self.chat_format == 'kimi-k2': return self.encode("<|im_" + role + "|>" + role + "<|im_middle|>")
+    if self.chat_format == 'qwen2': return self.encode("<|im_start|>" + role + "\n")
+    if self.chat_format == 'glm4': return self.encode("<|" + role + "|>")
+    if self.chat_format == 'tekken':
+      if role == 'user': return self.encode("[INST]")
+      if role == 'assistant': return []
+      raise ValueError(f"Unsupported role '{role}' for tokenizer preset '{self.chat_format}'")
+    return self.encode("<|start_header_id|>" + role + "<|end_header_id|>\n\n")
+  def end_turn(self) -> list[int]:
+    if self.chat_format == 'gemma4': return self.encode("<turn|>\n")
+    if self.chat_format == 'olmo': return self.encode("\n")
+    if self.chat_format == 'kimi-k2': return [self.eos_id]
+    if self.chat_format == 'qwen2': return [self.eos_id] + self.encode("\n")
+    if self.chat_format == 'glm4': return []
+    if self.chat_format == 'tekken': return self.encode("[/INST]")
+    return [self.eos_id]
+  def prefix(self) -> list[int]:
+    return ([] if self.bos_id is None else [self.bos_id]) + (self.encode("<sop>") if self.chat_format == 'glm4' else [])
+  def is_end(self, token_id:int) -> bool:
+    return token_id in (self._end_ids or {tid for tid in (self.eos_id, self.eot_id) if tid is not None})
+  def close_last_assistant_turn(self) -> bool: return self.chat_format == "gemma4"
 
-  def end_turn(self) -> list[int]: return self.encode("<|turn|>\n")
-  def prefix(self) -> list[int]: return [] if self.bos_id is None else [self.bos_id]
-  def is_end(self, token_id:int) -> bool: return token_id in self._end_ids
-  def close_last_assistant_turn(self) -> bool: return True
-
-def tokenizer_from_gguf_kv(kv:dict) -> Tokenizer:
-  if kv.get("tokenizer.ggml.model") == "gemma4" or kv.get("general.architecture") == "gemma4":
-    return Gemma4Tokenizer.from_gguf_kv(kv)
-  return SimpleTokenizer.from_gguf_kv(kv)
-
-def build_chat_completion_ids(tok:Tokenizer, messages:list[dict[str, typing.Any]]) -> list[int]:
+def build_chat_completion_ids(tok, messages:list[dict[str, typing.Any]]) -> list[int]:
   # Match /v1/chat/completions message serialization exactly.
   ids: list[int] = tok.prefix()
   for i, msg in enumerate(messages):
@@ -234,7 +216,7 @@ class Handler(HTTPRequestHandler):
     yield {"choices": [{"index":0, "delta":{"role":"assistant","content":""}, "finish_reason":None}], **tmpl}
     out: list[int] = []
     finish_reason = "stop"
-    st = time.perf_counter()
+    st = pt = time.perf_counter()
     dec = tok.stream_decoder()
     for next_id in model.generate(ids, temperature=temperature):
       if len(out) == 0: stderr_log(f"prefill:{(len(ids)-cache_start_pos)/((pt:=time.perf_counter())-st):4.0f} tok/s  {colored('--', 'BLACK')}  ")
@@ -277,7 +259,7 @@ class Handler(HTTPRequestHandler):
       raise RuntimeError(f"unhandled path {self.path}")
 
 class LLMServer(TCPServerWithReuse):
-  def __init__(self, server_address:tuple, model:LLMModel, model_name:str, tok:Tokenizer):
+  def __init__(self, server_address:tuple, model, model_name:str, tok):
     self.model, self.model_name, self.tok = model, model_name, tok
     super().__init__(server_address, Handler)
 
@@ -328,7 +310,12 @@ def main():
       break
     dec = tok.stream_decoder()
     for next_id in model.generate(ids):
-      sys.stdout.write(dec(next_id) if not tok.is_end(next_id) else dec() + "\n\n")
+      if not tok.is_end(next_id):
+        ids.append(next_id)
+        sys.stdout.write(dec(next_id))
+      else:
+        ids.append(next_id)
+        sys.stdout.write(dec() + "\n\n")
       sys.stdout.flush()
       if tok.is_end(next_id): break
 

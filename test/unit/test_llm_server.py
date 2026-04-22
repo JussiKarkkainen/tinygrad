@@ -2,10 +2,13 @@ import unittest
 from unittest.mock import patch
 from tinygrad import Tensor, UOp
 from tinygrad.schedule import schedule_cache
-from tinygrad.llm.model import Transformer, TransformerConfig
+from tinygrad.llm.model import Transformer, TransformerConfig, TransformerLayerConfig
 
 TEST_CONFIG = TransformerConfig(num_blocks=1, dim=64, hidden_dim=128, n_heads=2, n_kv_heads=2,
                            norm_eps=1e-5, vocab_size=100, head_dim=32, rope_theta=10000.0, rope_dim=32, v_head_dim=32, max_context=32)
+GEMMA4_TEST_CONFIG = TransformerConfig(num_blocks=1, dim=64, hidden_dim=128, n_heads=2, n_kv_heads=2,
+                           norm_eps=1e-5, vocab_size=100, head_dim=0, rope_theta=0.0, rope_dim=0, v_head_dim=0, max_context=32,
+                           layers=(TransformerLayerConfig(sliding_window=None, head_dim=32, rope_theta=10000.0),))
 
 class TestTransformerGenerate(unittest.TestCase):
   def test_kv_cache_reuse(self):
@@ -17,7 +20,7 @@ class TestTransformerGenerate(unittest.TestCase):
       captured_inputs.append((tokens.shape, start_pos if isinstance(start_pos, int) else start_pos.val))
       return Tensor([[42]])
 
-    with patch.object(Transformer, '__call__', mock_call):
+    with patch.object(Transformer, '__call__', mock_call), patch.object(model, '_sample_from_logits', return_value=Tensor([[42]])):
       # first conversation: prefill 5 tokens + 1 decode
       tokens = [1, 2, 3, 4, 5]
       gen = model.generate(tokens)
@@ -44,7 +47,7 @@ class TestTransformerGenerate(unittest.TestCase):
       captured_inputs.append((tokens.shape, start_pos if isinstance(start_pos, int) else start_pos.val))
       return Tensor([[42]])
 
-    with patch.object(Transformer, '__call__', mock_call):
+    with patch.object(Transformer, '__call__', mock_call), patch.object(model, '_sample_from_logits', return_value=Tensor([[42]])):
       # first conversation
       gen = model.generate([1, 2, 3, 4, 5])
       next(gen)
@@ -93,7 +96,7 @@ class TestTransformerGenerate(unittest.TestCase):
       def mock_call(self, tokens, start_pos, temperature):
         is_prefill.append(resolve(tokens.shape[1] != 1))
         return Tensor([[42]])
-      with patch.object(Transformer, '__call__', mock_call):
+      with patch.object(Transformer, '__call__', mock_call), patch.object(model, '_sample_from_logits', return_value=Tensor([[42]])):
         gen = model.generate(tokens, chunk_size=chunk_size)
         for _ in range(3): next(gen)
       model._cached_tokens = []
@@ -116,13 +119,24 @@ class TestTransformerGenerate(unittest.TestCase):
 
     # resume with conversation history + new user tokens appended
     extended = prompt + [out1, out2, 10, 11, 12]
-    gen = model.generate(list(extended))
-    resumed_out = [next(gen) for _ in range(3)]
+    def greedy_via_logits(model, tokens, steps):
+      tokens = list(tokens)
+      out = []
+      start_pos = model.get_start_pos(tokens)
+      for _ in range(steps):
+        logits = model.logits(Tensor(tokens[start_pos:], dtype="int32").reshape(1, len(tokens) - start_pos), start_pos).realize()
+        next_tok = int(logits.argmax(-1).item())
+        tokens.append(next_tok)
+        model._cached_tokens = tokens[:-1]
+        start_pos = len(tokens) - 1
+        out.append(next_tok)
+      return out
+
+    resumed_out = greedy_via_logits(model, extended, 3)
 
     # compare against fresh generation (no cache) of the same prompt
-    model._cached_tokens = []
-    gen = model.generate(list(extended))
-    fresh_out = [next(gen) for _ in range(3)]
+    model.reset_cache()
+    fresh_out = greedy_via_logits(model, extended, 3)
 
     self.assertEqual(fresh_out, resumed_out)
 
@@ -154,10 +168,54 @@ class TestTransformerGenerate(unittest.TestCase):
     def mock_call(self, tokens, start_pos, temperature):
       captured_temps.append(float(temperature.item()))
       return Tensor([[42]])
-    with patch.object(Transformer, '__call__', mock_call):
+    with patch.object(Transformer, '__call__', mock_call), patch.object(model, '_sample_from_logits', return_value=Tensor([[42]])):
       gen = model.generate([1, 2, 3], temperature=0.6)
       next(gen)
     self.assertAlmostEqual(captured_temps[-1], 0.6, places=5)
+
+class TestGemma4Generate(unittest.TestCase):
+  def test_generate_samples_logits(self):
+    model = Transformer(GEMMA4_TEST_CONFIG)
+    sampled = []
+
+    def mock_call(self, tokens, start_pos, temperature):
+      return Tensor([[0.0, 1.0, 0.0]])
+    def mock_sample(logits, temperature):
+      sampled.append((logits.tolist(), float(temperature.item())))
+      return Tensor([[7]])
+
+    with patch.object(Transformer, '__call__', mock_call), patch.object(model, '_sample_from_logits', side_effect=mock_sample):
+      gen = model.generate([1, 2, 3], temperature=0.6)
+      self.assertEqual(next(gen), 7)
+
+    self.assertEqual(len(sampled), 1)
+    self.assertEqual(sampled[0][0], [[0.0, 1.0, 0.0]])
+    self.assertAlmostEqual(sampled[0][1], 0.6, places=5)
+
+  def test_kv_cache_reuse(self):
+    model = Transformer(GEMMA4_TEST_CONFIG)
+
+    captured_inputs = []
+    def mock_call(self, tokens, start_pos, temperature):
+      captured_inputs.append((tokens.shape, start_pos if isinstance(start_pos, int) else start_pos.val))
+      return Tensor([[0.0, 1.0, 0.0]])
+
+    with patch.object(Transformer, '__call__', mock_call), patch.object(model, '_sample_from_logits', return_value=Tensor([[42]])):
+      # first conversation: prefill 5 tokens + 1 decode
+      tokens = [1, 2, 3, 4, 5]
+      gen = model.generate(tokens)
+      next(gen)  # prefill
+      next(gen)  # decode
+
+      # second call extends the conversation — cached prefix should be reused
+      captured_inputs.clear()
+      tokens = [1, 2, 3, 4, 5, 42, 42, 10, 11, 12]
+      gen = model.generate(tokens)
+      next(gen)
+
+    toks_shape = captured_inputs[0][0][-1]
+    self.assertEqual(toks_shape.val if isinstance(toks_shape, UOp) else toks_shape, 4)
+    self.assertEqual(captured_inputs[0][1], 6)
 
 if __name__ == '__main__':
   unittest.main()
