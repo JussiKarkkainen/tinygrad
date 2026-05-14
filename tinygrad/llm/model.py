@@ -122,9 +122,38 @@ class FFNBlock:
       self.ffn_up      = nn.Linear(config.dim, config.hidden_dim, bias=False)
       self.ffn_down    = nn.Linear(config.hidden_dim, config.dim, bias=False)
 
+  def _apply_ffn_gate_up(self, x:Tensor) -> tuple[Tensor, Tensor]:
+    if hasattr(self, 'ffn_gate_exps'): raise RuntimeError("_apply_ffn_gate_up only supports dense FFN blocks")
+    use_custom = bool(getenv("CUSTOM_KERNELS"))
+    if not use_custom:
+      xn = self.ffn_norm(x)
+      return self.ffn_gate(xn), self.ffn_up(xn)
+    if x.device != "METAL": raise RuntimeError(f"CUSTOM_KERNELS requires METAL for FFN gate/up, got {x.device}")
+    assert self.ffn_norm.weight is not None
+    assert self.ffn_gate.weight is not None and self.ffn_up.weight is not None
+    if x.dtype != dtypes.float or self.ffn_norm.weight.dtype != dtypes.half or self.ffn_gate.weight.dtype != dtypes.half or \
+       self.ffn_up.weight.dtype != dtypes.half or x.shape[-1] != self.config.dim or self.ffn_gate.weight.shape != (self.config.hidden_dim, self.config.dim) or \
+       self.ffn_up.weight.shape != (self.config.hidden_dim, self.config.dim):
+      raise RuntimeError("CUSTOM_KERNELS FFN gate/up contract mismatch")
+    from tinygrad.llm.metal_kernels import custom_ffn_gate_up
+    return custom_ffn_gate_up(x, self.ffn_norm.weight, self.ffn_gate.weight, self.ffn_up.weight, self.ffn_norm.eps)
+
+  def _apply_ffn_down(self, x:Tensor) -> Tensor:
+    if hasattr(self, 'ffn_gate_exps'): raise RuntimeError("_apply_ffn_down only supports dense FFN blocks")
+    use_custom = bool(getenv("CUSTOM_KERNELS"))
+    if not use_custom: return self.ffn_down(x)
+    if x.device != "METAL": raise RuntimeError(f"CUSTOM_KERNELS requires METAL for FFN down, got {x.device}")
+    assert self.ffn_down.weight is not None
+    if x.dtype != dtypes.float or self.ffn_down.weight.dtype != dtypes.half or x.shape[-1] != self.config.hidden_dim or \
+       self.ffn_down.weight.shape != (self.config.dim, self.config.hidden_dim):
+      raise RuntimeError("CUSTOM_KERNELS FFN down contract mismatch")
+    from tinygrad.llm.metal_kernels import custom_ffn_down
+    return custom_ffn_down(x, self.ffn_down.weight)
+
   def _feed_forward(self, x:Tensor) -> Tensor:
     act = Tensor.gelu if self.config.activation == "gelu" else Tensor.silu
     if hasattr(self, 'ffn_gate_exps'):
+      x = self.ffn_norm(x)
       h = x.unsqueeze(2)  # (B, T, 1, D) - add expert dim for broadcasting
       logits = self.ffn_gate_inp(x)
       if hasattr(self, 'exp_probs_b'):
@@ -143,8 +172,8 @@ class FFNBlock:
         if hasattr(self, 'ffn_gate_inp_shexp'): shexp = shexp * (x * self.ffn_gate_inp_shexp["weight"]).sum(axis=-1, keepdim=True).sigmoid()
         out = out + shexp
       return out
-    # TODO: remove the need for this contiguous
-    return self.ffn_down(act(self.ffn_gate(x)).contiguous() * self.ffn_up(x))
+    gate, up = self._apply_ffn_gate_up(x)
+    return self._apply_ffn_down(act(gate).contiguous() * up)
 
   # given the token-prefix match, return how much cached state this block can still reuse
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len
@@ -159,7 +188,7 @@ class FFNBlock:
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
       h =     x + self._attention(self.attn_norm(x), start_pos)
-      return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
+      return (h + self._feed_forward(h)).contiguous()
     return _run(x, start_pos)
 
 class TransformerBlock(FFNBlock):
@@ -392,7 +421,7 @@ class Gemma4Block(FFNBlock):
     shared_kv_states = {} if context is None or context.shared_kv_states is None else context.shared_kv_states
     self._init_state(x)
     h = x + self.post_attention_norm(self._attention(self.attn_norm(x), start_pos, shared_kv_states))
-    h = h + self.post_ffw_norm(self._feed_forward(self.ffn_norm(h)))
+    h = h + self.post_ffw_norm(self._feed_forward(h))
     if per_layer_input is not None and self.inp_gate is not None:
       act = Tensor.gelu if self.config.activation == "gelu" else Tensor.silu
       h = h + self.post_norm(self.proj(act(self.inp_gate(h)).contiguous() * per_layer_input))
@@ -452,10 +481,31 @@ class Transformer:
       x = block(x, start_pos, context, i)
     return x
 
+  def _apply_output_norm(self, x:Tensor) -> Tensor:
+    use_custom = bool(getenv("CUSTOM_KERNELS"))
+    if not use_custom: return self.output_norm(x)
+    if x.device != "METAL": raise RuntimeError(f"CUSTOM_KERNELS requires METAL for output_norm, got {x.device}")
+    assert self.output_norm.weight is not None
+    if x.dtype != dtypes.float or self.output_norm.weight.dtype != dtypes.half or x.shape[-1] != 2560 or abs(self.output_norm.eps - 1e-6) > 1e-12:
+      raise RuntimeError(f"CUSTOM_KERNELS output_norm contract mismatch: x.dtype={x.dtype}, weight.dtype={self.output_norm.weight.dtype}, "
+                         f"x.shape={x.shape}, eps={self.output_norm.eps}")
+    from tinygrad.llm.metal_kernels import custom_output_rmsnorm
+    return custom_output_rmsnorm(x, self.output_norm.weight, self.output_norm.eps)
+
+  def _apply_output(self, x:Tensor) -> Tensor:
+    use_custom = bool(getenv("CUSTOM_KERNELS"))
+    if not use_custom: return self.output(x)
+    if x.device != "METAL": raise RuntimeError(f"CUSTOM_KERNELS requires METAL for output projection, got {x.device}")
+    assert self.output.weight is not None
+    if x.dtype != dtypes.float or self.output.weight.dtype != dtypes.half or x.shape[-1] != 2560:
+      raise RuntimeError(f"CUSTOM_KERNELS output contract mismatch: x.dtype={x.dtype}, weight.dtype={self.output.weight.dtype}, x.shape={x.shape}")
+    from tinygrad.llm.metal_kernels import custom_output
+    return custom_output(x, self.output.weight)
+  
   def logits(self, tokens:Tensor, start_pos:int|UOp):
     x, context = self._prepare_hidden(tokens)
     x = self._run_blocks(x, start_pos, context)
-    logits = self.output(self.output_norm(x))[:, -1, :]
+    logits = self._apply_output(self._apply_output_norm(x))[:, -1, :]
     if self.config.final_logit_softcap: logits = (logits / self.config.final_logit_softcap).tanh() * self.config.final_logit_softcap
     return logits
 
